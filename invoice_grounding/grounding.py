@@ -208,7 +208,8 @@ def _resolve_unmatched_fields(fields: list[GroundedField], ocr_words: list[OCRWo
             continue
         seller_name = _seller_name_fallback(field, ocr_words)
         party_name = _party_name_fallback(field, ocr_words, matched_anchors, party_blocks)
-        resolved.append(seller_name or party_name or field)
+        long_text = _invoice_info_long_text_fallback(field, ocr_words)
+        resolved.append(seller_name or party_name or long_text or field)
     return resolved
 
 
@@ -474,6 +475,114 @@ def _looks_like_table_or_invoice_header(words: list[OCRWord]) -> bool:
         "pageno",
     )
     return any(marker in compact for marker in markers)
+
+
+def _invoice_info_long_text_fallback(field: GroundedField, ocr_words: list[OCRWord]) -> GroundedField | None:
+    if ".invoiceinfo." not in field.json_path.casefold() or field.field_name not in {"customerMemo", "paymentTerms"}:
+        return None
+    target_terms = _long_text_terms(field.value_as_text or "")
+    if len(target_terms) < 6:
+        return None
+
+    selected: list[OCRWord] = []
+    covered: set[int] = set()
+    similarities: list[float] = []
+    for target_index, target_term in enumerate(target_terms):
+        best_word: OCRWord | None = None
+        best_score = 0.0
+        for word in ocr_words:
+            if word.id in {item.id for item in selected}:
+                continue
+            context_bonus = _long_text_word_context_score(word, ocr_words)
+            for word_term in _long_text_terms(word.text):
+                score = _token_similarity(target_term, word_term)
+                if score > best_score or (
+                    best_word is not None
+                    and score == best_score
+                    and context_bonus > _long_text_word_context_score(best_word, ocr_words)
+                ):
+                    best_score = score
+                    best_word = word
+        threshold = 0.86 if any(char.isdigit() for char in target_term) else (0.82 if len(target_term) <= 4 else 0.74)
+        if best_word is not None and best_score >= threshold:
+            selected.append(best_word)
+            covered.add(target_index)
+            similarities.append(best_score)
+
+    coverage = len(covered) / len(target_terms)
+    if coverage < 0.58 or len(selected) < 6:
+        return None
+    if not _long_text_has_label_or_dense_phrase(field.field_name, selected, ocr_words):
+        return None
+    mean_similarity = sum(similarities) / len(similarities)
+    confidence = min(0.88, 0.62 + (coverage * 0.20) + (mean_similarity * 0.05))
+    return _field_from_words(
+        field,
+        _dedupe_words(selected),
+        match_method="invoice_info_long_text_partial",
+        confidence=confidence,
+        reason="Long invoiceInfo text recovered from reliable OCR substrings across nearby lines",
+    )
+
+
+def _long_text_terms(text: str) -> list[str]:
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "we",
+        "where",
+        "with",
+    }
+    terms = re.findall(r"[a-z0-9]+", normalize_text(text, keep_punctuation=False))
+    important = [
+        term
+        for term in terms
+        if term not in stopwords and (len(term) > 2 or (term.isdigit() and len(term) >= 3))
+    ]
+    return important or terms
+
+
+def _long_text_word_context_score(word: OCRWord, ocr_words: list[OCRWord]) -> float:
+    line_words = [item for item in ocr_words if item.line_id == word.line_id]
+    line_compact = _compact(" ".join(item.text for item in line_words))
+    score = 0.0
+    if any(label in line_compact for label in ("courier", "memo", "note", "terms")):
+        score += 0.20
+    y_center = (word.box_normalized.y_min + word.box_normalized.y_max) / 2
+    if y_center > 0.45:
+        score += 0.05
+    return score
+
+
+def _long_text_has_label_or_dense_phrase(field_name: str, selected_words: list[OCRWord], ocr_words: list[OCRWord]) -> bool:
+    selected_ids = {word.id for word in selected_words}
+    if field_name == "customerMemo" and any(_compact(word.text).startswith(("courier", "memo", "note")) for word in selected_words):
+        return True
+    if field_name == "paymentTerms" and any(_compact(word.text).startswith(("terms", "payment")) for word in selected_words):
+        return True
+    by_line = {word.line_id: [] for word in selected_words}
+    for word in ocr_words:
+        if word.line_id in by_line:
+            by_line[word.line_id].append(word)
+    for line_words in by_line.values():
+        selected_on_line = [word for word in line_words if word.id in selected_ids]
+        if len(selected_on_line) >= 4:
+            return True
+    return False
 
 
 def _name_terms(text: str) -> list[str]:
@@ -1074,16 +1183,18 @@ def _invoice_info_alternative_score(
     row_context = _compact(_row_label_text(words, all_words))
     field_name = field.field_name
     positive = {
-        "issueDate": ["invoice date", "issue date", "order date"],
+        "issueDate": ["invoice date", "issue date", "order date", "payment date"],
         "dueDate": ["due date", "payment due"],
-        "documentNumber": ["invoice number", "invoice no", "order number"],
+        "documentNumber": ["invoice number", "invoice no"],
         "purchaseOrderNumber": ["purchase order", "po number"],
+        "paymentTerms": ["payment terms", "terms", "type"],
     }.get(field_name, [])
     negative = {
-        "issueDate": ["tax point", "due date", "payment due"],
-        "dueDate": ["invoice date", "issue date", "order date", "tax point"],
-        "documentNumber": ["purchase order", "po number"],
+        "issueDate": ["tax point", "due date", "payment due", "booking date", "activation date"],
+        "dueDate": ["invoice date", "issue date", "order date", "tax point", "activation date", "payment date"],
+        "documentNumber": ["purchase order", "po number", "job no", "customer copy"],
         "purchaseOrderNumber": ["invoice number", "invoice no"],
+        "paymentTerms": ["customer", "deliver to", "trade cash sale", "invoice totals"],
     }.get(field_name, [])
     score = 0.0
     positive_compacts = [_compact(label) for label in positive]
@@ -1098,6 +1209,12 @@ def _invoice_info_alternative_score(
         score -= 0.46
     elif not row_positive and any(label in context for label in negative_compacts):
         score -= 0.24
+    if field_name == "documentNumber" and "customercopy" in context:
+        score -= 0.34
+    if field_name == "issueDate" and any(label in row_context for label in ("bookingdate", "activationdate")):
+        score -= 0.36
+    if field_name == "paymentTerms" and "tradecashsale" in row_context:
+        score -= 0.42
     return score
 
 

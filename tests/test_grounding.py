@@ -141,6 +141,102 @@ def test_late_date_resolution_feeds_iso_inheritance(make_word) -> None:
     assert iso.word_ids == issue_date.word_ids
 
 
+def test_invoice_info_prefers_invoice_date_over_booking_date(make_word) -> None:
+    image = Image.new("RGB", (1000, 500), "white")
+    words = [
+        make_word("Invoice", 0, 50, 80, 120, 105, width=1000, height=500),
+        make_word("Date:", 1, 125, 80, 180, 105, width=1000, height=500),
+        make_word("16", 2, 220, 80, 250, 105, width=1000, height=500),
+        make_word("Jul", 3, 255, 80, 290, 105, width=1000, height=500),
+        make_word("2024", 4, 295, 80, 345, 105, width=1000, height=500),
+        make_word("Booking", 5, 500, 80, 580, 105, width=1000, height=500),
+        make_word("Date:", 6, 585, 80, 640, 105, width=1000, height=500),
+        make_word("16", 7, 680, 80, 710, 105, width=1000, height=500),
+        make_word("Jul", 8, 715, 80, 750, 105, width=1000, height=500),
+        make_word("2024", 9, 755, 80, 805, 105, width=1000, height=500),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {"invoiceOutputData": {"invoiceInfo": {"issueDate": "16 Jul 2024", "issueDateISO": "2024-07-16"}}},
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    issue_date = by_path["invoiceOutputData.invoiceInfo.issueDate"]
+    iso = by_path["invoiceOutputData.invoiceInfo.issueDateISO"]
+    assert issue_date.status == GroundingStatus.MATCHED
+    assert issue_date.word_ids == [words[2].id, words[3].id, words[4].id]
+    assert iso.status == GroundingStatus.INHERITED
+    assert iso.word_ids == issue_date.word_ids
+
+
+def test_payment_terms_prefers_type_cash_over_trade_cash_sale(make_word) -> None:
+    image = Image.new("RGB", (1000, 700), "white")
+    words = [
+        make_word("TRADE", 0, 80, 100, 150, 125, width=1000, height=700),
+        make_word("CASH", 1, 155, 100, 215, 125, width=1000, height=700),
+        make_word("SALE", 2, 220, 100, 280, 125, width=1000, height=700),
+        make_word("Type:", 3, 80, 560, 135, 585, line=1, width=1000, height=700),
+        make_word("CASH", 4, 200, 560, 260, 585, line=1, width=1000, height=700),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {"invoiceOutputData": {"invoiceInfo": {"paymentTerms": "CASH"}}},
+        words,
+        config=GroundingConfig(),
+    )
+    field = result.fields[0]
+    assert field.status == GroundingStatus.MATCHED
+    assert field.word_ids == [words[4].id]
+    assert "resolved_by_context" in (field.match_method or "")
+
+
+def test_customer_memo_fallback_recovers_long_text_fragments(make_word) -> None:
+    image = Image.new("RGB", (1000, 700), "white")
+    words = [
+        make_word("In", 0, 80, 300, 105, 325, width=1000, height=700),
+        make_word("the", 1, 110, 300, 145, 325, width=1000, height=700),
+        make_word("case", 2, 150, 300, 200, 325, width=1000, height=700),
+        make_word("where", 3, 205, 300, 260, 325, width=1000, height=700),
+        make_word("goods", 4, 265, 300, 325, 325, width=1000, height=700),
+        make_word("are", 5, 330, 300, 365, 325, width=1000, height=700),
+        make_word("imported", 6, 370, 300, 455, 325, width=1000, height=700),
+        make_word("outside", 7, 460, 300, 535, 325, width=1000, height=700),
+        make_word("UK", 8, 540, 300, 570, 325, width=1000, height=700),
+        make_word("reserve", 9, 80, 335, 155, 360, line=1, width=1000, height=700),
+        make_word("right", 10, 160, 335, 210, 360, line=1, width=1000, height=700),
+        make_word("adjust", 11, 215, 335, 275, 360, line=1, width=1000, height=700),
+        make_word("lead", 12, 280, 335, 330, 360, line=1, width=1000, height=700),
+        make_word("times", 13, 335, 335, 390, 360, line=1, width=1000, height=700),
+        make_word("pricing", 14, 80, 370, 155, 395, line=2, width=1000, height=700),
+        make_word("accordingly.", 15, 160, 370, 270, 395, line=2, width=1000, height=700),
+        make_word("Courier:", 16, 80, 500, 160, 525, line=3, width=1000, height=700),
+        make_word("DPD", 17, 165, 500, 205, 525, line=3, width=1000, height=700),
+        make_word("NDD", 18, 230, 500, 270, 525, line=3, width=1000, height=700),
+        make_word("WISTON", 19, 300, 500, 370, 525, line=3, width=1000, height=700),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "invoiceInfo": {
+                    "customerMemo": (
+                        "Courier: DPD - NDD - WISTON. In the case where goods are imported from "
+                        "outside of the UK, we reserve the right to adjust lead times and pricing accordingly."
+                    )
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(max_lines_per_candidate=1),
+    )
+    field = result.fields[0]
+    assert field.status == GroundingStatus.MATCHED
+    assert field.match_method == "invoice_info_long_text_partial"
+    assert words[16].id in field.word_ids
+    assert words[6].id in field.word_ids
+
+
 def test_party_duplicate_names_resolve_with_block_labels(make_word) -> None:
     image = Image.new("RGB", (1000, 500), "white")
     words = [
