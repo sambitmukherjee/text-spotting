@@ -99,6 +99,7 @@ def ground_invoice_values_from_ocr(
     fields = _resolve_unmatched_fields(fields, ocr_words)
     fields = _resolve_ambiguous_fields(fields, ocr_words)
     fields = _resolve_ambiguous_fields(fields, ocr_words)
+    fields = _resolve_totals_label_fields(fields, ocr_words)
     fields = _resolve_late_inherited_fields(fields)
     timings["field_matching"] = _elapsed_ms(t0)
 
@@ -875,6 +876,251 @@ def _resolve_ambiguous_fields(fields: list[GroundedField], ocr_words: list[OCRWo
         else:
             resolved.append(field)
     return resolved
+
+
+def _resolve_totals_label_fields(fields: list[GroundedField], ocr_words: list[OCRWord]) -> list[GroundedField]:
+    words_by_id = {word.id: word for word in ocr_words}
+    resolved: list[GroundedField] = []
+    for field in fields:
+        if field.status != GroundingStatus.AMBIGUOUS or ".totals." not in field.json_path.casefold():
+            resolved.append(field)
+            continue
+        scored: list[tuple[float, CandidateSummary]] = []
+        for alternative in field.alternative_candidates:
+            words = [words_by_id[word_id] for word_id in alternative.word_ids if word_id in words_by_id]
+            if not words:
+                continue
+            score = _strict_totals_label_score(field, words, ocr_words)
+            scored.append((score, alternative))
+        if len(scored) < 2:
+            resolved.append(field)
+            continue
+        scored.sort(key=lambda item: item[0], reverse=True)
+        scored = _dedupe_overlapping_scored_alternatives(scored)
+        if len(scored) < 2:
+            resolved.append(field)
+            continue
+        best_score, best_alt = scored[0]
+        second_score = scored[1][0]
+        if best_score >= 0.78 and best_score - second_score >= 0.22:
+            resolved.append(_field_from_alternative(field, best_alt, words_by_id, best_score))
+        else:
+            resolved.append(field)
+    return resolved
+
+
+def _strict_totals_label_score(field: GroundedField, words: list[OCRWord], all_words: list[OCRWord]) -> float:
+    field_name = field.field_name
+    if ".othercharges" in field.json_path.casefold() and field_name == "value":
+        field_name = "otherChargesValue"
+    if ".othercharges" in field.json_path.casefold() and field_name == "key":
+        field_name = "otherChargesKey"
+
+    candidate_text = " ".join(word.text for word in words)
+    candidate_compact = _compact(candidate_text)
+    line_left_raw = _same_ocr_line_left_text(words, all_words)
+    line_left = _compact(line_left_raw)
+    row_left_raw = _row_label_text(words, all_words)
+    row_left = _compact(row_left_raw)
+    row_all_raw = _visual_row_text(words, all_words)
+    row_all = _compact(row_all_raw)
+    preceding = _compact(_preceding_window_text(words, all_words))
+    above = _compact(_above_same_column_text(words, all_words))
+    context = row_left + row_all + preceding + above
+    amount_count = _amount_like_token_count(row_all_raw)
+
+    score = _numeric_total_extra_text_penalty(field_name, field, words)
+    if field_name not in {"taxName", "otherChargesKey"} and not _looks_like_money_or_number(candidate_text):
+        score -= 0.50
+    if _looks_like_table_body_context(context) and not _has_direct_totals_summary_label(line_left + row_left):
+        score -= 0.45
+
+    if field_name == "subtotal":
+        if "subtotal" in line_left and "vatsubtotal" not in line_left:
+            score += 1.08
+        elif "itemsubtotal" in context:
+            score += 0.96
+        elif "subtotal" in row_left:
+            score += 0.72 if amount_count >= 3 else 1.04
+        elif "subtotal" in above or "subtotal" in preceding:
+            score += 0.62
+        elif "purchases" in row_left:
+            score += 0.88
+        blocking_total_labels = ("grandtotal", "invoicetotal", "documenttotal", "totalpaid", "amountdue", "balancedue")
+        if _has_total_label(line_left) or any(label in line_left for label in blocking_total_labels):
+            score -= 0.82
+        elif any(label in row_left for label in blocking_total_labels):
+            score -= 0.82
+        elif _has_total_label(row_left):
+            score -= 0.64
+        if (
+            amount_count >= 3
+            and "subtotal" not in line_left
+            and "itemsubtotal" not in context
+            and "purchases" not in row_left
+        ):
+            score = min(score, 0.72)
+        return score
+
+    if field_name == "totalExcludingTax":
+        ex_tax_labels = (
+            "productstotalexvat",
+            "totalexvat",
+            "totalexclvat",
+            "totalexcludingvat",
+            "totalnetamount",
+            "nettotal",
+        )
+        direct_label_context = line_left + row_left
+        has_direct_ex_tax_label = any(label in direct_label_context for label in ex_tax_labels)
+        has_direct_ex_tax_summary_label = has_direct_ex_tax_label and _has_direct_totals_summary_label(
+            direct_label_context
+        )
+        if has_direct_ex_tax_summary_label:
+            score += 1.16
+        tax_column_labels = ("itemsubtotal", "vatsubtotal", "exclvat", "excivat")
+        has_tax_column_context = any(label in context for label in tax_column_labels)
+        if not has_direct_ex_tax_label:
+            if _has_total_label(line_left) and has_tax_column_context:
+                score += 1.02
+            elif _has_total_label(row_left) and has_tax_column_context:
+                score += 0.90
+            elif has_tax_column_context:
+                score += 0.60
+            elif "netamount" in row_left or "goods" in row_left:
+                score += 0.78
+        if _has_total_label(line_left) and has_tax_column_context:
+            score += 0.24
+        if "subtotal" in row_left and not any(label in row_left for label in ex_tax_labels):
+            score -= 0.28
+        if any(label in row_left for label in ("grandtotal", "invoicetotal", "documenttotal", "amountdue", "balancedue")):
+            score -= 0.76
+        return score
+
+    if field_name == "totalIncludingTax":
+        total_labels = (
+            "grandtotal",
+            "documenttotal",
+            "invoicetotal",
+            "totalatcheckout",
+            "totalinclvat",
+            "totalincvat",
+            "totalprice",
+            "totalgbp",
+        )
+        if any(label in line_left for label in total_labels) or _has_total_label(line_left):
+            score += 1.12
+        elif any(label in row_left for label in total_labels) or _has_total_label(row_left):
+            score += 1.05
+        elif any(label in above for label in total_labels):
+            score += 0.82
+        negative_total_context = (
+            "subtotal",
+            "itemsubtotal",
+            "vatsubtotal",
+            "exclvat",
+            "excivat",
+            "amountpaid",
+            "lessamountpaid",
+        )
+        if (
+            not _has_total_label(line_left)
+            and not any(label in line_left for label in total_labels)
+            and any(label in context for label in negative_total_context)
+        ):
+            score -= 0.62
+        if any(label in row_left for label in ("balancedue", "amountdue")):
+            score -= 0.48
+        return score
+
+    if field_name == "taxName":
+        if candidate_compact in {"vat", "gst", "tax", "salestax"}:
+            score += 0.70
+            if any(label in row_left + row_all + above for label in ("vat", "gst", "tax", "vatsubtotal", "vat20")):
+                score += 0.32
+            elif _row_has_money_or_amount(row_all):
+                score += 0.32
+        if any(label in context for label in ("vatnumber", "registered", "registration", "email", "telephone", "tel", "web")):
+            score -= 0.80
+        return score
+
+    if field_name == "taxAmount":
+        if any(label in row_left + above for label in ("taxamount", "totaltax", "vatamount", "totalvat", "vatsubtotal")):
+            score += 0.96
+        elif any(label in row_left for label in ("vat", "tax")):
+            score += 0.72
+        if any(label in context for label in ("unitprice", "qty", "quantity", "subtotal", "amountpaid")):
+            score -= 0.42
+        return score
+
+    if field_name in {"discountTotal", "discountPercentage"}:
+        if "discount" in row_left and not _looks_like_table_body_context(context):
+            score += 0.78
+        return score
+
+    return 0.0
+
+
+def _above_same_column_text(words: list[OCRWord], all_words: list[OCRWord]) -> str:
+    word_ids = {word.id for word in words}
+    box = _word_union_normalized(words)
+    parts: list[OCRWord] = []
+    for word in all_words:
+        if word.id in word_ids:
+            continue
+        word_box = word.box_normalized
+        vertical_gap = box.y_min - word_box.y_max
+        horizontally_near = word_box.x_min <= box.x_max + 0.12 and word_box.x_max >= box.x_min - 0.20
+        if 0 <= vertical_gap <= 0.10 and horizontally_near:
+            parts.append(word)
+    return " ".join(word.text for word in sorted(parts, key=lambda item: item.reading_order)[-14:])
+
+
+def _same_ocr_line_left_text(words: list[OCRWord], all_words: list[OCRWord]) -> str:
+    word_ids = {word.id for word in words}
+    line_ids = {word.line_id for word in words}
+    box = _word_union_normalized(words)
+    parts = [
+        word.text
+        for word in all_words
+        if word.id not in word_ids and word.line_id in line_ids and word.box_normalized.x_max <= box.x_min + 0.02
+    ]
+    return " ".join(parts)
+
+
+def _has_direct_totals_summary_label(compact_text_value: str) -> bool:
+    if any(label in compact_text_value for label in ("productstotalexvat", "grandtotal", "invoicetotal", "documenttotal")):
+        return True
+    if _looks_like_table_body_context(compact_text_value):
+        return False
+    labels = (
+        "subtotal",
+        "totalexvat",
+        "totalexclvat",
+        "totalexcludingvat",
+        "nettotal",
+        "totalatcheckout",
+        "totalinclvat",
+        "totalincvat",
+        "shippingcharges",
+        "delivery",
+        "vatsubtotal",
+        "vatamount",
+        "totalvat",
+    )
+    return any(label in compact_text_value for label in labels)
+
+
+def _has_total_label(compact_text_value: str) -> bool:
+    if not compact_text_value or "subtotal" in compact_text_value or "vatsubtotal" in compact_text_value:
+        return False
+    if compact_text_value in {"total", "totaldue", "totalgbp"}:
+        return True
+    return compact_text_value.endswith("total") or compact_text_value.endswith("totaldue")
+
+
+def _amount_like_token_count(text: str) -> int:
+    return len(re.findall(r"(?:gbp|usd|eur|£|\$|€)?\s*\d{1,3}(?:[, ]\d{3})*(?:[.,]\d+)?%?", text.casefold()))
 
 
 def _dedupe_overlapping_scored_alternatives(

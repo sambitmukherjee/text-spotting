@@ -716,6 +716,92 @@ def test_totals_row_pair_resolves_other_charge_key_label(make_word) -> None:
     assert "resolved_by_context" in (field.match_method or "")
 
 
+def test_totals_label_coresolution_splits_duplicate_subtotal_and_total(make_word) -> None:
+    image = Image.new("RGB", (1000, 700), "white")
+    words = [
+        make_word("Subtotal:", 0, 500, 300, 585, 325, width=1000, height=700),
+        make_word("£50.00", 1, 700, 300, 770, 325, width=1000, height=700),
+        make_word("Total:", 2, 500, 340, 555, 365, line=1, width=1000, height=700),
+        make_word("£50.00", 3, 700, 340, 770, 365, line=1, width=1000, height=700),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "totals": {
+                    "subtotal": {"originalValue": "£50.00"},
+                    "totalIncludingTax": {"originalValue": "£50.00"},
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    subtotal = by_path["invoiceOutputData.totals.subtotal.originalValue"]
+    total = by_path["invoiceOutputData.totals.totalIncludingTax.originalValue"]
+    assert subtotal.status == GroundingStatus.MATCHED
+    assert subtotal.word_ids == [words[1].id]
+    assert total.status == GroundingStatus.MATCHED
+    assert total.word_ids == [words[3].id]
+
+
+def test_totals_label_coresolution_uses_column_total_for_excluding_tax(make_word) -> None:
+    image = Image.new("RGB", (1000, 800), "white")
+    words = [
+        make_word("Item", 0, 620, 430, 665, 455, width=1000, height=800),
+        make_word("subtotal", 1, 670, 430, 750, 455, width=1000, height=800),
+        make_word("VAT", 2, 780, 430, 820, 455, width=1000, height=800),
+        make_word("subtotal", 3, 825, 430, 905, 455, width=1000, height=800),
+        make_word("(excl.", 4, 650, 465, 710, 490, line=1, width=1000, height=800),
+        make_word("VAT)", 5, 715, 465, 760, 490, line=1, width=1000, height=800),
+        make_word("20.0%", 6, 500, 500, 560, 525, line=2, width=1000, height=800),
+        make_word("£9.32", 7, 700, 500, 760, 525, line=2, width=1000, height=800),
+        make_word("£1.86", 8, 840, 500, 900, 525, line=2, width=1000, height=800),
+        make_word("Total", 9, 500, 540, 555, 565, line=3, width=1000, height=800),
+        make_word("£9.32", 10, 700, 540, 760, 565, line=3, width=1000, height=800),
+        make_word("£1.86", 11, 840, 540, 900, 565, line=3, width=1000, height=800),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "totals": {
+                    "subtotal": {"originalValue": "£9.32"},
+                    "totalExcludingTax": {"originalValue": "£9.32"},
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    subtotal = by_path["invoiceOutputData.totals.subtotal.originalValue"]
+    total_ex_tax = by_path["invoiceOutputData.totals.totalExcludingTax.originalValue"]
+    assert subtotal.status == GroundingStatus.MATCHED
+    assert subtotal.word_ids == [words[7].id]
+    assert total_ex_tax.status == GroundingStatus.MATCHED
+    assert total_ex_tax.word_ids == [words[10].id]
+
+
+def test_totals_label_coresolution_leaves_multi_amount_subtotal_row_ambiguous(make_word) -> None:
+    image = Image.new("RGB", (1000, 800), "white")
+    words = [
+        make_word("Subtotal", 0, 500, 520, 585, 545, width=1000, height=800),
+        make_word("85.90", 1, 650, 520, 710, 545, width=1000, height=800),
+        make_word("0.00", 2, 735, 520, 785, 545, width=1000, height=800),
+        make_word("£85.90", 3, 820, 520, 895, 545, width=1000, height=800),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {"invoiceOutputData": {"totals": {"subtotal": {"originalValue": "85.9"}}}},
+        words,
+        config=GroundingConfig(),
+    )
+    field = result.fields[0]
+    assert field.status == GroundingStatus.AMBIGUOUS
+
+
 @pytest.mark.integration
 def test_doctr_integration_synthetic_invoice(tmp_path) -> None:
     if os.environ.get("RUN_DOCTR_INTEGRATION") != "1":
