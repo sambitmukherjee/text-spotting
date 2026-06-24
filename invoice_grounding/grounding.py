@@ -197,6 +197,8 @@ def _match_values(
 
 def _resolve_unmatched_fields(fields: list[GroundedField], ocr_words: list[OCRWord]) -> list[GroundedField]:
     resolved: list[GroundedField] = []
+    matched_anchors = [field for field in fields if field.status in {GroundingStatus.MATCHED, GroundingStatus.INHERITED}]
+    party_blocks = _party_role_blocks(matched_anchors)
     for field in fields:
         if field.status != GroundingStatus.UNMATCHED:
             resolved.append(field)
@@ -205,7 +207,8 @@ def _resolve_unmatched_fields(fields: list[GroundedField], ocr_words: list[OCRWo
             resolved.append(_not_groundable_currency(field))
             continue
         seller_name = _seller_name_fallback(field, ocr_words)
-        resolved.append(seller_name or field)
+        party_name = _party_name_fallback(field, ocr_words, matched_anchors, party_blocks)
+        resolved.append(seller_name or party_name or field)
     return resolved
 
 
@@ -287,6 +290,190 @@ def _seller_email_name_words(target_terms: list[str], ocr_words: list[OCRWord]) 
             selected.append(word)
             covered.update(matched)
     return selected, covered
+
+
+def _party_name_fallback(
+    field: GroundedField,
+    ocr_words: list[OCRWord],
+    anchors: list[GroundedField],
+    party_blocks: dict[str, NormalizedBoundingBox],
+) -> GroundedField | None:
+    role = _party_role(field.json_path)
+    if field.field_name != "name" or role is None:
+        return None
+    target_terms = _name_terms(field.value_as_text or "")
+    unique_terms = list(dict.fromkeys(target_terms))
+    if len(unique_terms) < 2:
+        return None
+
+    best: tuple[float, list[OCRWord], float, float] | None = None
+    for region_words, evidence in _party_name_regions(role, field.json_path, ocr_words, anchors, party_blocks):
+        selected_words, covered_terms = _party_name_region_matches(unique_terms, region_words)
+        if len(selected_words) < 2:
+            continue
+        coverage = len(covered_terms) / len(set(unique_terms))
+        if coverage < 0.72:
+            continue
+        compactness = _party_name_compactness_score(selected_words)
+        if compactness < 0.10:
+            continue
+        score = coverage + evidence + compactness
+        if best is None or score > best[0]:
+            best = (score, selected_words, coverage, evidence)
+
+    if best is None:
+        return None
+    _, selected_words, coverage, evidence = best
+    if evidence < 0.34:
+        return None
+    confidence = min(0.91, 0.70 + (coverage * 0.14) + (evidence * 0.06))
+    return _field_from_words(
+        field,
+        selected_words,
+        match_method="party_name_label_or_block_partial",
+        confidence=confidence,
+        reason="Party name recovered from nearby party label or sibling address block evidence",
+    )
+
+
+def _party_name_regions(
+    role: str,
+    json_path: str,
+    ocr_words: list[OCRWord],
+    anchors: list[GroundedField],
+    party_blocks: dict[str, NormalizedBoundingBox],
+) -> list[tuple[list[OCRWord], float]]:
+    regions: list[tuple[list[OCRWord], float]] = []
+    lines = _visual_lines(ocr_words)
+    for index, line_words in enumerate(lines):
+        label_score = _party_label_evidence(role, line_words)
+        if label_score <= 0.0:
+            continue
+        collected = list(line_words)
+        label_box = union_normalized_boxes([word.box_normalized for word in line_words])
+        for next_line in lines[index + 1 : index + 5]:
+            next_box = union_normalized_boxes([word.box_normalized for word in next_line])
+            if next_box.y_min - label_box.y_max > 0.16:
+                break
+            if _looks_like_table_or_invoice_header(next_line):
+                break
+            collected.extend(next_line)
+        regions.append((_dedupe_words(collected), label_score))
+
+    prefix = _party_prefix(json_path)
+    if prefix is not None:
+        sibling_boxes = [
+            anchor.union_box_normalized
+            for anchor in anchors
+            if anchor.union_box_normalized is not None
+            and anchor.json_path.startswith(prefix)
+            and anchor.json_path != json_path
+            and anchor.field_name != "phone"
+        ]
+        if sibling_boxes:
+            sibling_box = union_normalized_boxes(sibling_boxes)
+            regions.append((_words_near_party_box(ocr_words, sibling_box), 0.42))
+
+    if role in party_blocks:
+        regions.append((_words_near_party_box(ocr_words, party_blocks[role]), 0.34))
+
+    return [(words, evidence) for words, evidence in regions if words]
+
+
+def _party_label_evidence(role: str, line_words: list[OCRWord]) -> float:
+    compact = _compact(" ".join(word.text for word in line_words))
+    if role == "customer":
+        if any(label in compact for label in ("invoiceto", "billto", "soldto")):
+            return 0.70
+        if "customer" in compact and not any(label in compact for label in ("customerno", "customerref")):
+            return 0.52
+    if role == "shipto":
+        if any(label in compact for label in ("shipto", "deliverto", "deliveryto", "despatchto", "dispatchto")):
+            return 0.72
+    if role == "seller":
+        if any(label in compact for label in ("soldby", "seller", "supplier", "vendor")):
+            return 0.58
+    return 0.0
+
+
+def _party_name_region_matches(
+    target_terms: list[str],
+    region_words: list[OCRWord],
+) -> tuple[list[OCRWord], set[str]]:
+    selected: list[OCRWord] = []
+    covered: set[str] = set()
+    for target_term in target_terms:
+        best_word: OCRWord | None = None
+        best_score = 0.0
+        for word in region_words:
+            if word.id in {item.id for item in selected}:
+                continue
+            for word_term in _name_terms(word.text):
+                score = _token_similarity(target_term, word_term)
+                if score > best_score:
+                    best_score = score
+                    best_word = word
+        threshold = 0.82 if len(target_term) <= 5 else 0.78
+        if best_word is not None and best_score >= threshold:
+            selected.append(best_word)
+            covered.add(target_term)
+    return _dedupe_words(selected), covered
+
+
+def _party_name_compactness_score(words: list[OCRWord]) -> float:
+    if not words:
+        return 0.0
+    box = _word_union_normalized(words)
+    height = box.y_max - box.y_min
+    width = box.x_max - box.x_min
+    if height > 0.24 or width > 0.78:
+        return 0.0
+    line_count = len({word.line_id for word in words})
+    if line_count <= 2:
+        return 0.20
+    if line_count <= 4 and height <= 0.16:
+        return 0.12
+    return 0.04
+
+
+def _words_near_party_box(ocr_words: list[OCRWord], box: NormalizedBoundingBox) -> list[OCRWord]:
+    expanded = NormalizedBoundingBox(
+        x_min=max(0.0, box.x_min - 0.20),
+        y_min=max(0.0, box.y_min - 0.18),
+        x_max=min(1.0, box.x_max + 0.08),
+        y_max=min(1.0, box.y_max + 0.04),
+    )
+    return [
+        word
+        for word in sorted(ocr_words, key=lambda item: item.reading_order)
+        if _box_center_inside(word.box_normalized, expanded)
+    ]
+
+
+def _visual_lines(ocr_words: list[OCRWord]) -> list[list[OCRWord]]:
+    by_line: dict[str, list[OCRWord]] = {}
+    for word in ocr_words:
+        by_line.setdefault(word.line_id, []).append(word)
+    return sorted(
+        (sorted(words, key=lambda item: item.reading_order) for words in by_line.values()),
+        key=lambda words: (min(word.box_normalized.y_min for word in words), min(word.box_normalized.x_min for word in words)),
+    )
+
+
+def _looks_like_table_or_invoice_header(words: list[OCRWord]) -> bool:
+    compact = _compact(" ".join(word.text for word in words))
+    markers = (
+        "productcode",
+        "description",
+        "quantity",
+        "unitprice",
+        "subtotal",
+        "invoiceno",
+        "invoicenumber",
+        "taxdate",
+        "pageno",
+    )
+    return any(marker in compact for marker in markers)
 
 
 def _name_terms(text: str) -> list[str]:

@@ -257,6 +257,107 @@ def test_address_component_avoids_reusing_street_address_words(make_word) -> Non
     assert "resolved_by_context" in (city.match_method or "")
 
 
+def test_customer_name_fallback_uses_invoice_to_multiline_label(make_word) -> None:
+    image = Image.new("RGB", (1000, 700), "white")
+    words = [
+        make_word("Invoice", 0, 80, 120, 150, 145, width=1000, height=700),
+        make_word("To", 1, 155, 120, 185, 145, width=1000, height=700),
+        make_word("Serena", 2, 80, 170, 150, 195, line=1, width=1000, height=700),
+        make_word("Nice", 3, 80, 205, 130, 230, line=2, width=1000, height=700),
+        make_word("Bites", 4, 135, 205, 190, 230, line=2, width=1000, height=700),
+        make_word("Shipston", 5, 80, 245, 160, 270, line=3, width=1000, height=700),
+        make_word("CV36", 6, 80, 280, 130, 305, line=4, width=1000, height=700),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "parties": {
+                    "customer": {
+                        "name": "Serena, Nice Bites Cafe",
+                        "addressStructured": {"city": "Shipston", "postal_code": "CV36"},
+                    }
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    field = by_path["invoiceOutputData.parties.customer.name"]
+    assert field.status == GroundingStatus.MATCHED
+    assert field.word_ids == [words[2].id, words[3].id, words[4].id]
+    assert field.match_method == "party_name_label_or_block_partial"
+
+
+def test_shipto_name_fallback_prefers_despatch_to_over_invoice_to(make_word) -> None:
+    image = Image.new("RGB", (1000, 700), "white")
+    words = [
+        make_word("DESPATCHTO", 0, 100, 100, 210, 125, width=1000, height=700),
+        make_word("DETAILED", 1, 230, 100, 310, 125, width=1000, height=700),
+        make_word("PAINTWORK", 2, 315, 100, 420, 125, width=1000, height=700),
+        make_word("DAVID", 3, 230, 135, 290, 160, line=1, width=1000, height=700),
+        make_word("INVOICE", 4, 100, 260, 180, 285, line=2, width=1000, height=700),
+        make_word("TO", 5, 185, 260, 215, 285, line=2, width=1000, height=700),
+        make_word("DETAILED", 6, 230, 260, 310, 285, line=2, width=1000, height=700),
+        make_word("PAINTWORK", 7, 315, 260, 420, 285, line=2, width=1000, height=700),
+        make_word("DAVID", 8, 230, 295, 290, 320, line=3, width=1000, height=700),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "parties": {
+                    "customer": {"name": "DETAILED PAINTWORK DAVID"},
+                    "shipTo": {"name": "DETAILED PAINTWORK DAVID"},
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    customer = by_path["invoiceOutputData.parties.customer.name"]
+    ship_to = by_path["invoiceOutputData.parties.shipTo.name"]
+    assert customer.status == GroundingStatus.MATCHED
+    assert ship_to.status == GroundingStatus.MATCHED
+    assert customer.word_ids == [words[6].id, words[7].id, words[8].id]
+    assert ship_to.word_ids == [words[1].id, words[2].id, words[3].id]
+
+
+def test_customer_name_fallback_uses_sibling_address_block(make_word) -> None:
+    image = Image.new("RGB", (1000, 700), "white")
+    words = [
+        make_word("SARAH", 0, 100, 100, 160, 125, width=1000, height=700),
+        make_word("HUTCHINS", 1, 165, 100, 260, 125, width=1000, height=700),
+        make_word("SPECIALITY", 2, 100, 150, 210, 175, line=1, width=1000, height=700),
+        make_word("CAKES", 3, 215, 150, 280, 175, line=1, width=1000, height=700),
+        make_word("HIGH", 4, 285, 150, 340, 175, line=1, width=1000, height=700),
+        make_word("STREET", 5, 345, 150, 420, 175, line=1, width=1000, height=700),
+        make_word("WOKING", 6, 100, 200, 180, 225, line=2, width=1000, height=700),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "parties": {
+                    "customer": {
+                        "name": "SPECIALITY CAKES, Sarah Hutchins",
+                        "addressStructured": {"address": "HIGH STREET", "city": "WOKING"},
+                    }
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    field = by_path["invoiceOutputData.parties.customer.name"]
+    assert field.status == GroundingStatus.MATCHED
+    assert field.word_ids == [words[0].id, words[1].id, words[2].id, words[3].id]
+    assert field.match_method == "party_name_label_or_block_partial"
+
+
 def test_totals_summary_label_resolves_total_duplicate(make_word) -> None:
     image = Image.new("RGB", (1000, 600), "white")
     words = [
