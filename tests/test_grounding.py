@@ -454,6 +454,125 @@ def test_customer_name_fallback_uses_sibling_address_block(make_word) -> None:
     assert field.match_method == "party_name_label_or_block_partial"
 
 
+def test_party_structured_fallback_repairs_postal_code_and_country_alias(make_word) -> None:
+    image = Image.new("RGB", (1000, 700), "white")
+    words = [
+        make_word("Supplier", 0, 80, 80, 160, 105, width=1000, height=700),
+        make_word("Road", 1, 80, 130, 130, 155, line=1, width=1000, height=700),
+        make_word("Wigan", 2, 80, 165, 145, 190, line=2, width=1000, height=700),
+        make_word("WN4", 3, 80, 200, 130, 225, line=3, width=1000, height=700),
+        make_word("OBW", 4, 135, 200, 185, 225, line=3, width=1000, height=700),
+        make_word("GBR", 5, 190, 200, 240, 225, line=3, width=1000, height=700),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "parties": {
+                    "seller": {
+                        "name": "Supplier",
+                        "addressStructured": {
+                            "address": "Road",
+                            "city": "Wigan",
+                            "postal_code": "WN4 0BW",
+                            "country": "United Kingdom",
+                        },
+                    }
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    postal = by_path["invoiceOutputData.parties.seller.addressStructured.postal_code"]
+    country = by_path["invoiceOutputData.parties.seller.addressStructured.country"]
+    assert postal.status == GroundingStatus.MATCHED
+    assert postal.word_ids == [words[3].id, words[4].id]
+    assert country.status == GroundingStatus.MATCHED
+    assert country.word_ids == [words[5].id]
+    assert country.match_method == "party_country_alias"
+
+
+def test_party_structured_fallback_recovers_phone_suffix_and_noisy_email(make_word) -> None:
+    image = Image.new("RGB", (1000, 700), "white")
+    words = [
+        make_word("Paint", 0, 600, 80, 660, 105, width=1000, height=700),
+        make_word("Services", 1, 665, 80, 750, 105, width=1000, height=700),
+        make_word("Oxford", 2, 600, 130, 670, 155, line=1, width=1000, height=700),
+        make_word("Road", 3, 675, 130, 725, 155, line=1, width=1000, height=700),
+        make_word("RG30", 4, 600, 165, 655, 190, line=2, width=1000, height=700),
+        make_word("6AW", 5, 660, 165, 705, 190, line=2, width=1000, height=700),
+        make_word("Tel:", 6, 600, 205, 640, 230, line=3, width=1000, height=700),
+        make_word("9470516", 7, 645, 205, 730, 230, line=3, width=1000, height=700),
+        make_word("Email:", 8, 600, 245, 660, 270, line=4, width=1000, height=700),
+        make_word("axcouns@punat-ervies.cout", 9, 665, 245, 890, 270, line=4, width=1000, height=700),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "parties": {
+                    "seller": {
+                        "name": "Paint Services",
+                        "addressStructured": {"address": "Oxford Road", "postal_code": "RG30 6AW"},
+                        "phone": "0118 9470516",
+                        "email": "accounts@paint-services.co.uk",
+                    }
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    phone = by_path["invoiceOutputData.parties.seller.phone"]
+    email = by_path["invoiceOutputData.parties.seller.email"]
+    assert phone.status == GroundingStatus.MATCHED
+    assert phone.word_ids == [words[7].id]
+    assert phone.match_method == "party_phone_partial_suffix"
+    assert email.status == GroundingStatus.MATCHED
+    assert email.word_ids == [words[9].id]
+
+
+def test_country_alias_does_not_cross_party_blocks(make_word) -> None:
+    image = Image.new("RGB", (1000, 800), "white")
+    words = [
+        make_word("Seller", 0, 80, 80, 150, 105, width=1000, height=800),
+        make_word("Road", 1, 80, 130, 130, 155, line=1, width=1000, height=800),
+        make_word("GBR", 2, 80, 170, 130, 195, line=2, width=1000, height=800),
+        make_word("Invoice", 3, 80, 380, 155, 405, line=3, width=1000, height=800),
+        make_word("To", 4, 160, 380, 190, 405, line=3, width=1000, height=800),
+        make_word("Customer", 5, 80, 430, 175, 455, line=4, width=1000, height=800),
+        make_word("Lane", 6, 80, 480, 130, 505, line=5, width=1000, height=800),
+        make_word("BB1", 7, 80, 530, 125, 555, line=6, width=1000, height=800),
+        make_word("9DR", 8, 130, 530, 175, 555, line=6, width=1000, height=800),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "parties": {
+                    "seller": {"name": "Seller", "addressStructured": {"address": "Road", "country": "GB"}},
+                    "customer": {
+                        "name": "Customer",
+                        "addressStructured": {
+                            "address": "Lane",
+                            "postal_code": "BB1 9DR",
+                            "country": "United Kingdom",
+                        },
+                    },
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    country = by_path["invoiceOutputData.parties.customer.addressStructured.country"]
+    assert country.status == GroundingStatus.UNMATCHED
+
+
 def test_totals_summary_label_resolves_total_duplicate(make_word) -> None:
     image = Image.new("RGB", (1000, 600), "white")
     words = [

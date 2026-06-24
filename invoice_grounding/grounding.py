@@ -98,6 +98,7 @@ def ground_invoice_values_from_ocr(
     fields = _match_values(values, candidates, ocr_words, config)
     fields = _resolve_unmatched_fields(fields, ocr_words)
     fields = _resolve_ambiguous_fields(fields, ocr_words)
+    fields = _resolve_ambiguous_fields(fields, ocr_words)
     fields = _resolve_late_inherited_fields(fields)
     timings["field_matching"] = _elapsed_ms(t0)
 
@@ -208,8 +209,9 @@ def _resolve_unmatched_fields(fields: list[GroundedField], ocr_words: list[OCRWo
             continue
         seller_name = _seller_name_fallback(field, ocr_words)
         party_name = _party_name_fallback(field, ocr_words, matched_anchors, party_blocks)
+        party_structured = _party_structured_fallback(field, ocr_words, matched_anchors, party_blocks)
         long_text = _invoice_info_long_text_fallback(field, ocr_words)
-        resolved.append(seller_name or party_name or long_text or field)
+        resolved.append(seller_name or party_name or party_structured or long_text or field)
     return resolved
 
 
@@ -451,6 +453,27 @@ def _words_near_party_box(ocr_words: list[OCRWord], box: NormalizedBoundingBox) 
     ]
 
 
+def _words_in_expanded_box(
+    ocr_words: list[OCRWord],
+    box: NormalizedBoundingBox,
+    *,
+    x_pad: float,
+    y_above: float,
+    y_below: float,
+) -> list[OCRWord]:
+    expanded = NormalizedBoundingBox(
+        x_min=max(0.0, box.x_min - x_pad),
+        y_min=max(0.0, box.y_min - y_above),
+        x_max=min(1.0, box.x_max + x_pad),
+        y_max=min(1.0, box.y_max + y_below),
+    )
+    return [
+        word
+        for word in sorted(ocr_words, key=lambda item: item.reading_order)
+        if _box_center_inside(word.box_normalized, expanded)
+    ]
+
+
 def _visual_lines(ocr_words: list[OCRWord]) -> list[list[OCRWord]]:
     by_line: dict[str, list[OCRWord]] = {}
     for word in ocr_words:
@@ -523,6 +546,169 @@ def _invoice_info_long_text_fallback(field: GroundedField, ocr_words: list[OCRWo
         confidence=confidence,
         reason="Long invoiceInfo text recovered from reliable OCR substrings across nearby lines",
     )
+
+
+def _party_structured_fallback(
+    field: GroundedField,
+    ocr_words: list[OCRWord],
+    anchors: list[GroundedField],
+    party_blocks: dict[str, NormalizedBoundingBox],
+) -> GroundedField | None:
+    role = _party_role(field.json_path)
+    if role is None:
+        return None
+    role_words = _role_context_words(field.json_path, role, ocr_words, anchors, party_blocks)
+    if not role_words:
+        return None
+    if field.field_name in {"postal_code", "postalCode"}:
+        return _postal_code_fallback(field, role_words)
+    if field.field_name == "country":
+        return _country_fallback(field, role_words)
+    if field.field_name == "phone":
+        return _phone_fallback(field, role_words)
+    if field.field_name == "email":
+        return _email_fallback(field, role_words, ocr_words)
+    return None
+
+
+def _role_context_words(
+    json_path: str,
+    role: str,
+    ocr_words: list[OCRWord],
+    anchors: list[GroundedField],
+    party_blocks: dict[str, NormalizedBoundingBox],
+) -> list[OCRWord]:
+    if role in party_blocks:
+        return _words_in_expanded_box(ocr_words, party_blocks[role], x_pad=0.06, y_above=0.04, y_below=0.08)
+    prefix = _party_prefix(json_path)
+    if prefix is None:
+        return []
+    boxes = [
+        anchor.union_box_normalized
+        for anchor in anchors
+        if anchor.union_box_normalized is not None
+        and anchor.json_path.startswith(prefix)
+        and anchor.json_path != json_path
+    ]
+    if not boxes:
+        return []
+    return _words_in_expanded_box(ocr_words, union_normalized_boxes(boxes), x_pad=0.06, y_above=0.04, y_below=0.08)
+
+
+def _postal_code_fallback(field: GroundedField, role_words: list[OCRWord]) -> GroundedField | None:
+    target = _postal_compact(field.value_as_text or "")
+    if len(target) < 5:
+        return None
+    ordered = sorted(role_words, key=lambda item: item.reading_order)
+    for start in range(len(ordered)):
+        for end in range(start + 1, min(len(ordered), start + 3) + 1):
+            words = ordered[start:end]
+            text = " ".join(word.text for word in words)
+            if _postal_compact(text) == target:
+                return _field_from_words(
+                    field,
+                    words,
+                    match_method="party_postal_code_ocr_repair",
+                    confidence=0.86,
+                    reason="Postal code recovered from party block with OCR character repair",
+                )
+    return None
+
+
+def _country_fallback(field: GroundedField, role_words: list[OCRWord]) -> GroundedField | None:
+    target = _country_alias(field.value_as_text or "")
+    if target is None:
+        return None
+    ordered = sorted(role_words, key=lambda item: item.reading_order)
+    for start in range(len(ordered)):
+        for end in range(start + 1, min(len(ordered), start + 2) + 1):
+            words = ordered[start:end]
+            if _country_alias(" ".join(word.text for word in words)) == target:
+                return _field_from_words(
+                    field,
+                    words,
+                    match_method="party_country_alias",
+                    confidence=0.86,
+                    reason="Country recovered from equivalent printed country code/name in party block",
+                )
+    return None
+
+
+def _phone_fallback(field: GroundedField, role_words: list[OCRWord]) -> GroundedField | None:
+    target_digits = re.sub(r"\D+", "", field.value_as_text or "")
+    if len(target_digits) < 9:
+        return None
+    for word in sorted(role_words, key=lambda item: item.reading_order):
+        digits = re.sub(r"\D+", "", word.text)
+        if len(digits) >= 7 and (target_digits.endswith(digits) or digits.endswith(target_digits)):
+            return _field_from_words(
+                field,
+                [word],
+                match_method="party_phone_partial_suffix",
+                confidence=0.80,
+                reason="Phone number recovered from long matching suffix inside the party block",
+            )
+    return None
+
+
+def _email_fallback(field: GroundedField, role_words: list[OCRWord], ocr_words: list[OCRWord]) -> GroundedField | None:
+    target = _email_ocr_compact(field.value_as_text or "")
+    if not target or "@" not in target:
+        return None
+    best_word: OCRWord | None = None
+    best_score = 0.0
+    for word in role_words:
+        candidate = _email_ocr_compact(word.text)
+        if "@" not in candidate:
+            continue
+        score = _token_similarity(target, candidate)
+        if _line_has_label(word, ocr_words, "email"):
+            score += 0.08
+        if score > best_score:
+            best_score = score
+            best_word = word
+    if best_word is None or best_score < 0.68:
+        return None
+    return _field_from_words(
+        field,
+        [best_word],
+        match_method="party_email_ocr_tolerant",
+        confidence=min(0.84, best_score),
+        reason="Email recovered from OCR-noisy address in party block",
+    )
+
+
+def _postal_compact(text: str) -> str:
+    compact = re.sub(r"[^a-z0-9]+", "", text.casefold()).upper()
+    compact = compact.replace("O", "0")
+    compact = compact.replace("I", "1")
+    return compact
+
+
+def _country_alias(text: str) -> str | None:
+    compact = _compact(text)
+    aliases = {
+        "gb": "GB",
+        "gbr": "GB",
+        "uk": "GB",
+        "unitedkingdom": "GB",
+        "greatbritain": "GB",
+        "england": "GB",
+    }
+    return aliases.get(compact)
+
+
+def _email_ocr_compact(text: str) -> str:
+    normalized = normalize_text(text, keep_punctuation=True)
+    normalized = normalized.replace(" ", "")
+    normalized = normalized.replace("£", "e")
+    normalized = normalized.replace("|", "l")
+    return normalized
+
+
+def _line_has_label(word: OCRWord, ocr_words: list[OCRWord], label: str) -> bool:
+    compact = _compact(" ".join(item.text for item in ocr_words if item.line_id == word.line_id))
+    return label in compact
 
 
 def _long_text_terms(text: str) -> list[str]:
