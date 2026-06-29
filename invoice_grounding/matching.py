@@ -35,6 +35,7 @@ from invoice_grounding.normalization import (
     looks_phone_path,
     normalize_text,
     numeric_equivalent,
+    parse_numeric,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -172,6 +173,7 @@ def match_groundable_value(
         for candidate in candidates
         if (scored_candidate := _score_candidate(target, candidate, words, config)) is not None
     ]
+    scored = _cluster_numeric_value_candidates(target, scored, words, config)
     scored.sort(key=_ranking_key, reverse=True)
 
     if config.debug:
@@ -307,6 +309,82 @@ def _field_equivalent(target: GroundableValue, candidate: CandidateSpan) -> bool
     if looks_email_path(path):
         return bool(canonical_email(value)) and canonical_email(value) == canonical_email(candidate.text)
     return False
+
+
+def _cluster_numeric_value_candidates(
+    target: GroundableValue,
+    scored: list[_ScoredCandidate],
+    words: list[OCRWord],
+    config: GroundingConfig,
+) -> list[_ScoredCandidate]:
+    target_text = target.value_as_text or ""
+    if not looks_numeric_path(target.json_path) or parse_numeric(target_text) is None:
+        return scored
+
+    clustered: dict[tuple[str, ...], _ScoredCandidate] = {}
+    rescored_anchors: dict[tuple[str, ...], _ScoredCandidate | None] = {}
+    for item in scored:
+        anchor = _minimal_numeric_value_anchor(target_text, item.candidate)
+        if anchor is None:
+            continue
+        key = tuple(anchor.word_ids)
+        representative = rescored_anchors.get(key)
+        if key not in rescored_anchors:
+            representative = (
+                item
+                if key == tuple(item.candidate.word_ids)
+                else _score_candidate(target, anchor, words, config)
+            )
+            rescored_anchors[key] = representative
+        if representative is None:
+            continue
+        existing = clustered.get(key)
+        if existing is None or _ranking_key(representative) > _ranking_key(existing):
+            clustered[key] = representative
+    return list(clustered.values())
+
+
+def _minimal_numeric_value_anchor(target_text: str, candidate: CandidateSpan) -> CandidateSpan | None:
+    for length in range(1, len(candidate.words) + 1):
+        matches: dict[tuple[str, ...], CandidateSpan] = {}
+        for start in range(0, len(candidate.words) - length + 1):
+            selected = candidate.words[start : start + length]
+            text = " ".join(word.text for word in selected)
+            if not numeric_equivalent(target_text, text):
+                continue
+            if not _preserves_required_numeric_markers(target_text, text):
+                continue
+            anchor = _candidate_from_words(selected)
+            matches[tuple(anchor.word_ids)] = anchor
+        if len(matches) == 1:
+            return next(iter(matches.values()))
+        if len(matches) > 1:
+            return None
+    return candidate
+
+
+def _preserves_required_numeric_markers(target_text: str, candidate_text: str) -> bool:
+    target_lower = target_text.casefold()
+    candidate_lower = candidate_text.casefold()
+    currency_markers = (
+        "$",
+        "€",
+        "£",
+        "¥",
+        "₹",
+        "usd",
+        "eur",
+        "gbp",
+        "jpy",
+        "cny",
+        "inr",
+    )
+    if any(marker in target_lower for marker in currency_markers):
+        if not any(marker in candidate_lower for marker in currency_markers):
+            return False
+    if "%" in target_text and "%" not in candidate_text:
+        return False
+    return True
 
 
 def _component_match(target: GroundableValue, candidate: CandidateSpan) -> _ComponentMatch | None:

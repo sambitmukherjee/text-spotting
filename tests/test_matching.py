@@ -102,6 +102,59 @@ def test_tight_exact_value_beats_larger_containing_span(make_word) -> None:
     assert field.matched_text == "1.81"
 
 
+def test_numeric_candidate_clustering_keeps_one_tight_span_per_occurrence(make_word) -> None:
+    words = [
+        make_word("Subtotal", 0, 100, 100, 180, 125),
+        make_word("24.14", 1, 220, 100, 280, 125),
+        make_word("Line", 2, 20, 200, 60, 225, line=1),
+        make_word("24.14", 3, 800, 200, 860, 225, line=1),
+        make_word("24.14", 4, 220, 300, 280, 325, line=2),
+        make_word("Total", 5, 700, 300, 760, 325, line=2),
+        make_word("(GBP)", 6, 765, 300, 825, 325, line=2),
+    ]
+    target = GroundableValue(
+        json_path="invoiceOutputData.totals.subtotal.originalValue",
+        field_name="subtotal",
+        value="24.14",
+        value_as_text="24.14",
+        groundable=True,
+    )
+    field = match_groundable_value(target, generate_candidates(words), words, GroundingConfig())
+    candidates = [(field.matched_text, field.word_ids)] if field.matched_text else []
+    candidates.extend((item.matched_text, item.word_ids) for item in field.alternative_candidates)
+    distinct = {tuple(word_ids) for _, word_ids in candidates}
+
+    assert distinct == {(words[1].id,), (words[3].id,), (words[4].id,)}
+    assert all(text == "24.14" for text, _ in candidates)
+
+
+def test_numeric_candidate_clustering_preserves_distinct_tax_occurrences(make_word) -> None:
+    words = [
+        make_word("VAT", 0, 100, 100, 140, 125),
+        make_word("TOTAL", 1, 145, 100, 205, 125),
+        make_word("336.00", 2, 700, 100, 780, 125),
+        make_word("TOTAL", 3, 100, 140, 160, 165, line=1),
+        make_word("VAT", 4, 100, 220, 140, 245, line=2),
+        make_word("@", 5, 145, 220, 160, 245, line=2),
+        make_word("20%", 6, 165, 220, 205, 245, line=2),
+        make_word("336.00", 7, 700, 220, 780, 245, line=2),
+    ]
+    target = GroundableValue(
+        json_path="invoiceOutputData.totals.taxAmount.originalValue",
+        field_name="taxAmount",
+        value="336.00",
+        value_as_text="336.00",
+        groundable=True,
+    )
+    field = match_groundable_value(target, generate_candidates(words), words, GroundingConfig())
+    candidates = [(field.matched_text, field.word_ids)] if field.matched_text else []
+    candidates.extend((item.matched_text, item.word_ids) for item in field.alternative_candidates)
+    distinct = {tuple(word_ids) for _, word_ids in candidates}
+
+    assert distinct == {(words[2].id,), (words[7].id,)}
+    assert all(text == "336.00" for text, _ in candidates)
+
+
 def test_currency_symbol_can_ground_normalized_currency(make_word) -> None:
     words = [
         make_word("Invoice", 0, 10, 10, 60, 30),

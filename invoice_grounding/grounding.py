@@ -920,6 +920,7 @@ def _strict_totals_label_score(field: GroundedField, words: list[OCRWord], all_w
     candidate_compact = _compact(candidate_text)
     line_left_raw = _same_ocr_line_left_text(words, all_words)
     line_left = _compact(line_left_raw)
+    direct_left = _compact(_direct_row_left_text(words, all_words))
     row_left_raw = _row_label_text(words, all_words)
     row_left = _compact(row_left_raw)
     row_all_raw = _visual_row_text(words, all_words)
@@ -936,12 +937,18 @@ def _strict_totals_label_score(field: GroundedField, words: list[OCRWord], all_w
         score -= 0.45
 
     if field_name == "subtotal":
-        if "subtotal" in line_left and "vatsubtotal" not in line_left:
+        if "subtotal" in direct_left and "vatsubtotal" not in direct_left:
+            score += 1.20
+        elif (
+            "subtotal" in line_left
+            and "vatsubtotal" not in line_left
+            and _amount_like_token_count(line_left_raw) == 0
+        ):
             score += 1.08
         elif "itemsubtotal" in context:
             score += 0.96
         elif "subtotal" in row_left:
-            score += 0.72 if amount_count >= 3 else 1.04
+            score += 0.72 if _amount_like_token_count(row_left_raw) else 1.04
         elif "subtotal" in above or "subtotal" in preceding:
             score += 0.62
         elif "purchases" in row_left:
@@ -956,6 +963,7 @@ def _strict_totals_label_score(field: GroundedField, words: list[OCRWord], all_w
         if (
             amount_count >= 3
             and "subtotal" not in line_left
+            and "subtotal" not in direct_left
             and "itemsubtotal" not in context
             and "purchases" not in row_left
         ):
@@ -1086,6 +1094,28 @@ def _same_ocr_line_left_text(words: list[OCRWord], all_words: list[OCRWord]) -> 
         if word.id not in word_ids and word.line_id in line_ids and word.box_normalized.x_max <= box.x_min + 0.02
     ]
     return " ".join(parts)
+
+
+def _direct_row_left_text(words: list[OCRWord], all_words: list[OCRWord]) -> str:
+    word_ids = {word.id for word in words}
+    box = _word_union_normalized(words)
+    y_center = (box.y_min + box.y_max) / 2
+    y_tolerance = max(0.012, (box.y_max - box.y_min) * 0.75)
+    left_words: list[OCRWord] = []
+    for word in all_words:
+        if word.id in word_ids:
+            continue
+        word_box = word.box_normalized
+        word_y_center = (word_box.y_min + word_box.y_max) / 2
+        horizontal_gap = box.x_min - word_box.x_max
+        if 0 <= horizontal_gap <= 0.30 and abs(word_y_center - y_center) <= y_tolerance:
+            left_words.append(word)
+    left_words.sort(key=lambda word: (word.box_normalized.x_min, word.reading_order))
+    for index in range(len(left_words) - 1, -1, -1):
+        if _looks_like_money_or_number(left_words[index].text):
+            left_words = left_words[index + 1 :]
+            break
+    return " ".join(word.text for word in left_words[-8:])
 
 
 def _has_direct_totals_summary_label(compact_text_value: str) -> bool:

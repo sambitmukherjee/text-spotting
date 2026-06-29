@@ -784,7 +784,7 @@ def test_totals_label_coresolution_uses_column_total_for_excluding_tax(make_word
     assert total_ex_tax.word_ids == [words[10].id]
 
 
-def test_totals_label_coresolution_leaves_multi_amount_subtotal_row_ambiguous(make_word) -> None:
+def test_totals_label_coresolution_uses_direct_subtotal_before_other_amounts(make_word) -> None:
     image = Image.new("RGB", (1000, 800), "white")
     words = [
         make_word("Subtotal", 0, 500, 520, 585, 545, width=1000, height=800),
@@ -799,7 +799,8 @@ def test_totals_label_coresolution_leaves_multi_amount_subtotal_row_ambiguous(ma
         config=GroundingConfig(),
     )
     field = result.fields[0]
-    assert field.status == GroundingStatus.AMBIGUOUS
+    assert field.status == GroundingStatus.MATCHED
+    assert field.word_ids == [words[1].id]
 
 
 @pytest.mark.integration
