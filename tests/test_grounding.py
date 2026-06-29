@@ -636,6 +636,9 @@ def test_totals_row_pair_resolves_total_excluding_tax(make_word) -> None:
         make_word("Ex", 10, 650, 270, 675, 295, line=2, width=1000, height=600),
         make_word("Vat:", 11, 680, 270, 720, 295, line=2, width=1000, height=600),
         make_word("£62.50", 12, 760, 270, 830, 295, line=2, width=1000, height=600),
+        make_word("Sub", 13, 600, 315, 635, 340, line=3, width=1000, height=600),
+        make_word("Total:", 14, 640, 315, 695, 340, line=3, width=1000, height=600),
+        make_word("£62.50", 15, 760, 315, 830, 340, line=3, width=1000, height=600),
     ]
     result = ground_invoice_values_from_ocr(
         image,
@@ -646,7 +649,7 @@ def test_totals_row_pair_resolves_total_excluding_tax(make_word) -> None:
     field = result.fields[0]
     assert field.status == GroundingStatus.MATCHED
     assert field.word_ids == [words[12].id]
-    assert "resolved_by_context" in (field.match_method or "")
+    assert field.match_method in {"exact_raw_text", "exact_raw_text_resolved_by_context"}
 
 
 def test_totals_row_pair_resolves_shipping_charge_value(make_word) -> None:
@@ -801,6 +804,47 @@ def test_totals_label_coresolution_uses_direct_subtotal_before_other_amounts(mak
     field = result.fields[0]
     assert field.status == GroundingStatus.MATCHED
     assert field.word_ids == [words[1].id]
+
+
+def test_discount_total_uses_summary_row_instead_of_line_item_discounts(make_word) -> None:
+    image = Image.new("RGB", (1000, 800), "white")
+    words = [
+        make_word("Description", 0, 50, 160, 150, 185, width=1000, height=800),
+        make_word("Qty", 1, 250, 160, 290, 185, width=1000, height=800),
+        make_word("Unit", 2, 350, 160, 390, 185, width=1000, height=800),
+        make_word("Price", 3, 395, 160, 445, 185, width=1000, height=800),
+        make_word("Discount", 4, 530, 160, 610, 185, width=1000, height=800),
+        make_word("Value", 5, 630, 160, 680, 185, width=1000, height=800),
+    ]
+    order = len(words)
+    for row, y in enumerate((220, 260, 300, 340, 380, 420), start=1):
+        words.extend(
+            [
+                make_word(f"Item{row}", order, 50, y, 110, y + 25, line=row, width=1000, height=800),
+                make_word("1", order + 1, 260, y, 275, y + 25, line=row, width=1000, height=800),
+                make_word("0.00", order + 2, 630, y, 690, y + 25, line=row, width=1000, height=800),
+            ]
+        )
+        order += 3
+    summary_line = 7
+    words.extend(
+        [
+            make_word("Subtotal", order, 350, 520, 430, 545, line=summary_line, width=1000, height=800),
+            make_word("85.90", order + 1, 470, 520, 530, 545, line=summary_line, width=1000, height=800),
+            make_word("0.00", order + 2, 630, 520, 690, 545, line=summary_line, width=1000, height=800),
+            make_word("£85.90", order + 3, 750, 520, 825, 545, line=summary_line, width=1000, height=800),
+        ]
+    )
+    result = ground_invoice_values_from_ocr(
+        image,
+        {"invoiceOutputData": {"totals": {"discountTotal": {"originalValue": "0.0"}}}},
+        words,
+        config=GroundingConfig(),
+    )
+    field = result.fields[0]
+
+    assert field.status == GroundingStatus.MATCHED
+    assert field.word_ids == [words[-2].id]
 
 
 @pytest.mark.integration

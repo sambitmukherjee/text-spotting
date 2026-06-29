@@ -155,6 +155,63 @@ def test_numeric_candidate_clustering_preserves_distinct_tax_occurrences(make_wo
     assert all(text == "336.00" for text, _ in candidates)
 
 
+def test_invoice_summary_candidates_suppress_table_body_occurrences(make_word) -> None:
+    words = [
+        make_word("Description", 0, 80, 180, 180, 205, width=1000, height=800),
+        make_word("Qty", 1, 300, 180, 340, 205, width=1000, height=800),
+        make_word("Unit", 2, 500, 180, 540, 205, width=1000, height=800),
+        make_word("Price", 3, 545, 180, 595, 205, width=1000, height=800),
+        make_word("Subtotal", 4, 750, 180, 835, 205, width=1000, height=800),
+        make_word("Service", 5, 80, 240, 150, 265, line=1, width=1000, height=800),
+        make_word("1", 6, 310, 240, 325, 265, line=1, width=1000, height=800),
+        make_word("50.00", 7, 520, 240, 580, 265, line=1, width=1000, height=800),
+        make_word("50.00", 8, 760, 240, 820, 265, line=1, width=1000, height=800),
+        make_word("Subtotal:", 9, 650, 340, 735, 365, line=2, width=1000, height=800),
+        make_word("£50.00", 10, 760, 340, 830, 365, line=2, width=1000, height=800),
+        make_word("Total:", 11, 680, 380, 735, 405, line=3, width=1000, height=800),
+        make_word("£50.00", 12, 760, 380, 830, 405, line=3, width=1000, height=800),
+    ]
+    target = GroundableValue(
+        json_path="invoiceOutputData.totals.subtotal.originalValue",
+        field_name="subtotal",
+        value="£50.00",
+        value_as_text="£50.00",
+        groundable=True,
+    )
+    field = match_groundable_value(target, generate_candidates(words), words, GroundingConfig())
+    candidate_ids = {tuple(item.word_ids) for item in field.alternative_candidates}
+    if field.word_ids:
+        candidate_ids.add(tuple(field.word_ids))
+
+    assert (words[7].id,) not in candidate_ids
+    assert (words[8].id,) not in candidate_ids
+    assert (words[10].id,) in candidate_ids
+    assert (words[12].id,) in candidate_ids
+
+
+def test_table_candidate_remains_when_no_summary_occurrence_exists(make_word) -> None:
+    words = [
+        make_word("Description", 0, 80, 180, 180, 205, width=1000, height=800),
+        make_word("Qty", 1, 300, 180, 340, 205, width=1000, height=800),
+        make_word("Unit", 2, 500, 180, 540, 205, width=1000, height=800),
+        make_word("Price", 3, 545, 180, 595, 205, width=1000, height=800),
+        make_word("Service", 4, 80, 240, 150, 265, line=1, width=1000, height=800),
+        make_word("1", 5, 310, 240, 325, 265, line=1, width=1000, height=800),
+        make_word("62.50", 6, 520, 240, 580, 265, line=1, width=1000, height=800),
+    ]
+    target = GroundableValue(
+        json_path="invoiceOutputData.totals.totalExcludingTax.originalValue",
+        field_name="totalExcludingTax",
+        value="62.50",
+        value_as_text="62.50",
+        groundable=True,
+    )
+    field = match_groundable_value(target, generate_candidates(words), words, GroundingConfig())
+
+    assert field.status == GroundingStatus.MATCHED
+    assert field.word_ids == [words[6].id]
+
+
 def test_currency_symbol_can_ground_normalized_currency(make_word) -> None:
     words = [
         make_word("Invoice", 0, 10, 10, 60, 30),

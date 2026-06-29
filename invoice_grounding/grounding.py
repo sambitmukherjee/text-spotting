@@ -925,6 +925,8 @@ def _strict_totals_label_score(field: GroundedField, words: list[OCRWord], all_w
     row_left = _compact(row_left_raw)
     row_all_raw = _visual_row_text(words, all_words)
     row_all = _compact(row_all_raw)
+    tight_row = _compact(_tight_visual_row_text(words, all_words))
+    column_header = _compact(_column_header_text(words, all_words))
     preceding = _compact(_preceding_window_text(words, all_words))
     above = _compact(_above_same_column_text(words, all_words))
     context = row_left + row_all + preceding + above
@@ -1062,7 +1064,9 @@ def _strict_totals_label_score(field: GroundedField, words: list[OCRWord], all_w
         return score
 
     if field_name in {"discountTotal", "discountPercentage"}:
-        if "discount" in row_left and not _looks_like_table_body_context(context):
+        if _has_direct_totals_summary_label(tight_row) and "discount" in column_header:
+            score += 1.08
+        elif "discount" in row_left and not _looks_like_table_body_context(context):
             score += 0.78
         return score
 
@@ -1419,6 +1423,8 @@ def _totals_alternative_score(
     context = _compact(_preceding_window_text(words, all_words))
     row_context = _compact(_row_label_text(words, all_words))
     summary_context = _compact(_visual_row_text(words, all_words))
+    tight_row_context = _compact(_tight_visual_row_text(words, all_words))
+    column_header_context = _compact(_column_header_text(words, all_words))
     field_name = field.field_name
     if ".othercharges" in field.json_path.casefold() and field_name == "value":
         field_name = "otherChargesValue"
@@ -1459,13 +1465,16 @@ def _totals_alternative_score(
         "taxPercentage": ["zero rated", "unit", "qty", "product description"],
         "taxAmount": ["subtotal", "total paid", "amount paid", "unit", "qty"],
         "taxName": ["registered", "regl no", "email", "web"],
-        "discountTotal": ["vat", "tax", "subtotal", "total paid", "unit", "qty"],
-        "discountPercentage": ["vat", "tax", "subtotal", "total paid", "unit", "qty"],
+        "discountTotal": ["vat", "tax", "total paid", "unit", "qty"],
+        "discountPercentage": ["vat", "tax", "total paid", "unit", "qty"],
         "otherChargesValue": ["customer credit", "paypal", "subtotal", "vat", "tax"],
         "subtotal": ["invoice total", "grand total", "amount paid", "amount due", "donation"],
         "totalExcludingTax": ["invoice total", "grand total", "amount paid", "amount due", "donation"],
     }.get(field_name, [])
     score = summary_score + row_pair_score + extra_text_penalty
+    if field_name in {"discountTotal", "discountPercentage"}:
+        if _has_direct_totals_summary_label(tight_row_context) and "discount" in column_header_context:
+            score += 0.92
     positive_compacts = [_compact(label) for label in positive]
     negative_compacts = [_compact(label) for label in negative]
     if any(label in row_context for label in positive_compacts):
@@ -1857,6 +1866,35 @@ def _visual_row_text(words: list[OCRWord], all_words: list[OCRWord]) -> str:
         if same_visual_row or same_ocr_line:
             parts.append(word.text)
     return " ".join(parts)
+
+
+def _tight_visual_row_text(words: list[OCRWord], all_words: list[OCRWord]) -> str:
+    box = _word_union_normalized(words)
+    y_center = (box.y_min + box.y_max) / 2
+    y_tolerance = max(0.010, min(0.014, (box.y_max - box.y_min) * 0.80))
+    row = [
+        word
+        for word in all_words
+        if abs(((word.box_normalized.y_min + word.box_normalized.y_max) / 2) - y_center) <= y_tolerance
+    ]
+    row.sort(key=lambda word: (word.box_normalized.x_min, word.reading_order))
+    return " ".join(word.text for word in row)
+
+
+def _column_header_text(words: list[OCRWord], all_words: list[OCRWord]) -> str:
+    word_ids = {word.id for word in words}
+    box = _word_union_normalized(words)
+    parts: list[OCRWord] = []
+    for word in all_words:
+        if word.id in word_ids or not any(character.isalpha() for character in word.text):
+            continue
+        word_box = word.box_normalized
+        word_x_center = (word_box.x_min + word_box.x_max) / 2
+        vertical_gap = box.y_min - word_box.y_max
+        if 0 <= vertical_gap <= 0.16 and box.x_min - 0.08 <= word_x_center <= box.x_max + 0.08:
+            parts.append(word)
+    parts.sort(key=lambda word: word.reading_order)
+    return " ".join(word.text for word in parts)
 
 
 def _word_union_normalized(words: list[OCRWord]) -> NormalizedBoundingBox:

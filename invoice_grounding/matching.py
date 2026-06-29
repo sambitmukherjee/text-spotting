@@ -49,7 +49,18 @@ FIELD_LABEL_HINTS: dict[str, list[str]] = {
     "paymentTerms": ["payment terms", "terms"],
     "customerMemo": ["memo", "customer memo", "description", "reference"],
     "subtotal": ["subtotal", "sub total", "net amount", "net total", "total net amount", "goods"],
-    "totalExcludingTax": ["total excluding tax", "net total", "net amount", "total net amount", "goods"],
+    "totalExcludingTax": [
+        "total excluding tax",
+        "products total ex vat",
+        "total ex vat",
+        "total excl vat",
+        "net total",
+        "net amount",
+        "total net amount",
+        "subtotal",
+        "sub total",
+        "goods",
+    ],
     "taxAmount": ["tax amount", "total tax", "sales tax", "vat amount", "vat", "gst"],
     "taxPercentage": ["tax rate", "tax %", "vat rate", "gst rate", "vat %"],
     "taxName": ["sales tax", "vat", "v.a.t", "gst"],
@@ -174,6 +185,7 @@ def match_groundable_value(
         if (scored_candidate := _score_candidate(target, candidate, words, config)) is not None
     ]
     scored = _cluster_numeric_value_candidates(target, scored, words, config)
+    scored = _prefer_invoice_summary_candidates(target, scored, words)
     scored.sort(key=_ranking_key, reverse=True)
 
     if config.debug:
@@ -385,6 +397,163 @@ def _preserves_required_numeric_markers(target_text: str, candidate_text: str) -
     if "%" in target_text and "%" not in candidate_text:
         return False
     return True
+
+
+def _prefer_invoice_summary_candidates(
+    target: GroundableValue,
+    scored: list[_ScoredCandidate],
+    words: list[OCRWord],
+) -> list[_ScoredCandidate]:
+    if ".totals." not in target.json_path.casefold() or parse_numeric(target.value_as_text or "") is None:
+        return scored
+
+    summary_scores = {
+        tuple(item.candidate.word_ids): _invoice_summary_evidence_score(target, item.candidate, words)
+        for item in scored
+    }
+    strong_summary = [
+        item
+        for item in scored
+        if summary_scores[tuple(item.candidate.word_ids)] >= 0.72
+    ]
+    if not strong_summary:
+        return scored
+
+    first_summary_y = min(_candidate_y_center(item.candidate) for item in strong_summary)
+    filtered = []
+    for item in scored:
+        summary_score = summary_scores[tuple(item.candidate.word_ids)]
+        is_before_summary = _candidate_y_center(item.candidate) < first_summary_y - 0.006
+        if summary_score < 0.72 and is_before_summary and _has_table_header_above(item.candidate, words):
+            continue
+        filtered.append(item)
+    return filtered or scored
+
+
+def _invoice_summary_evidence_score(
+    target: GroundableValue,
+    candidate: CandidateSpan,
+    words: list[OCRWord],
+) -> float:
+    row_words = _tight_visual_row_words(candidate, words)
+    row_text = compact_text(" ".join(word.text for word in row_words))
+    field_labels = {
+        "subtotal": (
+            "subtotal",
+            "productstotalexvat",
+            "nettotal",
+            "totalnetamount",
+            "netamount",
+            "purchases",
+        ),
+        "totalExcludingTax": (
+            "productstotalexvat",
+            "totalexvat",
+            "totalexclvat",
+            "totalexcludingvat",
+            "nettotal",
+            "totalnetamount",
+            "subtotal",
+        ),
+        "taxAmount": ("vattotal", "totalvat", "vatamount", "taxamount", "totaltax"),
+        "discountTotal": ("discounttotal", "discount"),
+        "discountPercentage": ("discountpercentage", "discount"),
+        "totalIncludingTax": (
+            "grandtotal",
+            "invoicetotal",
+            "documenttotal",
+            "totalinclvat",
+            "totalincvat",
+            "totalgbp",
+            "totalprice",
+        ),
+        "deposit": ("deposit", "amountpaid", "lessamountpaid"),
+        "balanceDue": ("balancedue", "amountdue", "totaldue"),
+        "value": ("shippingcharges", "delivery", "postage", "surcharge"),
+    }.get(target.field_name, ())
+    if any(label in row_text for label in field_labels):
+        return 1.0
+    if target.field_name == "totalIncludingTax" and _has_direct_bare_total_label(candidate, row_words):
+        return 1.0
+
+    generic_summary_labels = (
+        "subtotal",
+        "productstotalexvat",
+        "grandtotal",
+        "invoicetotal",
+        "documenttotal",
+        "vattotal",
+        "totalvat",
+        "totalpaid",
+        "balancedue",
+        "amountdue",
+    )
+    if any(label in row_text for label in generic_summary_labels):
+        return 0.78
+
+    above_text = compact_text(_nearby_above_text(candidate, words, max_vertical_gap=0.10))
+    if target.field_name in {"taxAmount", "taxPercentage", "taxName"} and "vatsummary" in above_text:
+        return 0.78
+    return 0.0
+
+
+def _tight_visual_row_words(candidate: CandidateSpan, words: list[OCRWord]) -> list[OCRWord]:
+    box = candidate.bbox_normalized
+    y_center = (box.y_min + box.y_max) / 2
+    y_tolerance = max(0.010, min(0.014, (box.y_max - box.y_min) * 0.80))
+    row = [
+        word
+        for word in words
+        if abs(((word.box_normalized.y_min + word.box_normalized.y_max) / 2) - y_center) <= y_tolerance
+    ]
+    return sorted(row, key=lambda word: (word.box_normalized.x_min, word.reading_order))
+
+
+def _has_direct_bare_total_label(candidate: CandidateSpan, row_words: list[OCRWord]) -> bool:
+    left_words = [
+        word
+        for word in row_words
+        if word.id not in candidate.word_ids and word.box_normalized.x_max <= candidate.bbox_normalized.x_min
+    ]
+    left_words.sort(key=lambda word: (word.box_normalized.x_min, word.reading_order))
+    left_text = compact_text(" ".join(word.text for word in left_words))
+    return left_text in {"total", "totalgbp", "totaldue"}
+
+
+def _has_table_header_above(candidate: CandidateSpan, words: list[OCRWord]) -> bool:
+    above_text = compact_text(_nearby_above_text(candidate, words, max_vertical_gap=0.30))
+    marker_groups = (
+        ("description", "productdescription"),
+        ("qty", "quantity"),
+        ("unitprice", "unitcost"),
+        ("productno", "productcode", "stockcode", "itemcode"),
+        ("discountvalue", "discountpercentage"),
+        ("vatapplied", "vatrate"),
+        ("gross", "net"),
+        ("subtotal", "totalexvat"),
+    )
+    return sum(any(marker in above_text for marker in group) for group in marker_groups) >= 2
+
+
+def _nearby_above_text(
+    candidate: CandidateSpan,
+    words: list[OCRWord],
+    *,
+    max_vertical_gap: float,
+) -> str:
+    parts = []
+    for word in words:
+        if word.id in candidate.word_ids:
+            continue
+        vertical_gap = candidate.bbox_normalized.y_min - word.box_normalized.y_max
+        if 0 <= vertical_gap <= max_vertical_gap:
+            parts.append(word)
+    parts.sort(key=lambda word: word.reading_order)
+    return " ".join(word.text for word in parts)
+
+
+def _candidate_y_center(candidate: CandidateSpan) -> float:
+    return (candidate.bbox_normalized.y_min + candidate.bbox_normalized.y_max) / 2
 
 
 def _component_match(target: GroundableValue, candidate: CandidateSpan) -> _ComponentMatch | None:
