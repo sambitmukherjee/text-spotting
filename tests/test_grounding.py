@@ -317,6 +317,60 @@ def test_party_block_anchors_resolve_duplicate_contact_values(make_word) -> None
     assert "resolved_by_context" in (ship_to_phone.match_method or "")
 
 
+def test_party_address_blocks_resolve_punctuation_only_state_duplicates(make_word) -> None:
+    image = Image.new("RGB", (1000, 800), "white")
+    words = [
+        make_word("Buyer", 0, 100, 100, 150, 125, width=1000, height=800),
+        make_word("Road", 1, 155, 100, 200, 125, width=1000, height=800),
+        make_word("BuyerTown", 2, 100, 140, 190, 165, line=1, width=1000, height=800),
+        make_word("Warwickshire", 3, 100, 180, 215, 205, line=2, width=1000, height=800),
+        make_word("AA1", 4, 100, 220, 135, 245, line=3, width=1000, height=800),
+        make_word("1AA", 5, 140, 220, 175, 245, line=3, width=1000, height=800),
+        make_word("Seller", 6, 100, 560, 155, 585, line=4, width=1000, height=800),
+        make_word("Road", 7, 160, 560, 205, 585, line=4, width=1000, height=800),
+        make_word("SellerTown", 8, 100, 600, 195, 625, line=5, width=1000, height=800),
+        make_word("Warwickshire,", 9, 100, 640, 220, 665, line=6, width=1000, height=800),
+        make_word("BB2", 10, 100, 680, 135, 705, line=7, width=1000, height=800),
+        make_word("2BB", 11, 140, 680, 175, 705, line=7, width=1000, height=800),
+    ]
+    result = ground_invoice_values_from_ocr(
+        image,
+        {
+            "invoiceOutputData": {
+                "parties": {
+                    "customer": {
+                        "addressStructured": {
+                            "address": "Buyer Road",
+                            "city": "BuyerTown",
+                            "state": "Warwickshire",
+                            "postal_code": "AA1 1AA",
+                        }
+                    },
+                    "seller": {
+                        "addressStructured": {
+                            "address": "Seller Road",
+                            "city": "SellerTown",
+                            "state": "Warwickshire",
+                            "postal_code": "BB2 2BB",
+                        }
+                    },
+                }
+            }
+        },
+        words,
+        config=GroundingConfig(),
+    )
+    by_path = {field.json_path: field for field in result.fields}
+    customer = by_path["invoiceOutputData.parties.customer.addressStructured.state"]
+    seller = by_path["invoiceOutputData.parties.seller.addressStructured.state"]
+
+    assert customer.status == GroundingStatus.MATCHED
+    assert seller.status == GroundingStatus.MATCHED
+    assert customer.word_ids == [words[3].id]
+    assert seller.word_ids == [words[9].id]
+    assert "resolved_by_context" in (customer.match_method or "")
+
+
 def test_address_component_avoids_reusing_street_address_words(make_word) -> None:
     image = Image.new("RGB", (1000, 600), "white")
     words = [

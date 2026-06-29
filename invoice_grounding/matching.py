@@ -1080,7 +1080,11 @@ def _should_mark_ambiguous(
         return False
     if _overlapping_candidates(top, second):
         return False
-    if top.text_score >= 0.98 and second.text_score < 0.98:
+    if (
+        top.text_score >= 0.98
+        and second.text_score < 0.98
+        and not _party_address_punctuation_equivalent(target, top, second)
+    ):
         return False
     if top.tightness_score - second.tightness_score >= 0.22:
         return False
@@ -1093,6 +1097,20 @@ def _should_mark_ambiguous(
 
 def _same_strength(left: _ScoredCandidate, right: _ScoredCandidate) -> bool:
     return left.text_score >= 0.88 and right.text_score >= 0.88
+
+
+def _party_address_punctuation_equivalent(
+    target: GroundableValue,
+    left: _ScoredCandidate,
+    right: _ScoredCandidate,
+) -> bool:
+    path = target.json_path.casefold()
+    if ".parties." not in path or ".addressstructured." not in path:
+        return False
+    target_text = compact_text(target.value_as_text or "", keep_punctuation=False)
+    left_text = compact_text(left.candidate.text, keep_punctuation=False)
+    right_text = compact_text(right.candidate.text, keep_punctuation=False)
+    return bool(target_text) and left_text == target_text and right_text == target_text
 
 
 def _overlapping_candidates(left: _ScoredCandidate, right: _ScoredCandidate) -> bool:
