@@ -850,17 +850,34 @@ def _resolve_ambiguous_fields(fields: list[GroundedField], ocr_words: list[OCRWo
         if field.status != GroundingStatus.AMBIGUOUS or not field.alternative_candidates:
             resolved.append(field)
             continue
-        scored = _score_ambiguous_alternatives(
+        alternatives = _exclude_cross_role_owned_candidates(
             field,
             field.alternative_candidates,
             words_by_id,
             matched_anchors,
             party_blocks,
         )
-        if len(scored) < 2:
+        ownership_pruned = len(alternatives) != len(field.alternative_candidates)
+        if ownership_pruned:
+            field = field.model_copy(update={"alternative_candidates": alternatives})
+        scored = _score_ambiguous_alternatives(
+            field,
+            alternatives,
+            words_by_id,
+            matched_anchors,
+            party_blocks,
+        )
+        if not scored:
             resolved.append(field)
             continue
         scored.sort(key=lambda item: item[0], reverse=True)
+        if len(scored) == 1:
+            best_score, best_alt = scored[0]
+            if ownership_pruned and best_score >= 0.26:
+                resolved.append(_field_from_alternative(field, best_alt, words_by_id, best_score))
+            else:
+                resolved.append(field)
+            continue
         scored = _dedupe_overlapping_scored_alternatives(scored)
         if len(scored) < 2:
             best_score, best_alt = scored[0]
@@ -1360,6 +1377,81 @@ def _party_role_blocks(anchors: list[GroundedField]) -> dict[str, NormalizedBoun
         if boxes:
             blocks[role] = _expand_normalized_box(union_normalized_boxes(boxes), x_pad=0.035, y_pad=0.045)
     return blocks
+
+
+def _exclude_cross_role_owned_candidates(
+    field: GroundedField,
+    alternatives: list[CandidateSummary],
+    words_by_id: dict[str, OCRWord],
+    anchors: list[GroundedField],
+    party_blocks: dict[str, NormalizedBoundingBox],
+) -> list[CandidateSummary]:
+    role = _party_role(field.json_path)
+    if role is None or "addressstructured" not in field.json_path.casefold():
+        return alternatives
+    own_block = party_blocks.get(role)
+    if own_block is None or _party_address_anchor_count(role, anchors, exclude_field=field.field_name) < 2:
+        return alternatives
+
+    owned_by_other_role: list[tuple[set[str], NormalizedBoundingBox]] = []
+    for anchor in anchors:
+        other_role = _party_role(anchor.json_path)
+        if (
+            other_role is None
+            or other_role == role
+            or anchor.field_name != field.field_name
+            or not anchor.word_ids
+        ):
+            continue
+        other_block = party_blocks.get(other_role)
+        if (
+            other_block is None
+            or _party_address_anchor_count(other_role, anchors, exclude_field=field.field_name) < 2
+        ):
+            continue
+        if _box_distance(own_block, other_block) <= 0.08:
+            continue
+        owned_by_other_role.append((set(anchor.word_ids), other_block))
+
+    if not owned_by_other_role:
+        return alternatives
+
+    retained: list[CandidateSummary] = []
+    for alternative in alternatives:
+        alternative_ids = set(alternative.word_ids)
+        words = [words_by_id[word_id] for word_id in alternative.word_ids if word_id in words_by_id]
+        if not words:
+            retained.append(alternative)
+            continue
+        candidate_box = _word_union_normalized(words)
+        claimed_elsewhere = any(
+            alternative_ids == owned_ids
+            and _box_center_inside(candidate_box, other_block)
+            and not _box_center_inside(candidate_box, own_block)
+            for owned_ids, other_block in owned_by_other_role
+        )
+        if not claimed_elsewhere:
+            retained.append(alternative)
+    return retained or alternatives
+
+
+def _party_address_anchor_count(
+    role: str,
+    anchors: list[GroundedField],
+    *,
+    exclude_field: str,
+) -> int:
+    stable_fields = {"address", "city", "state", "postal_code", "postalCode"}
+    return len(
+        {
+            anchor.field_name
+            for anchor in anchors
+            if _party_role(anchor.json_path) == role
+            and anchor.field_name in stable_fields
+            and anchor.field_name != exclude_field
+            and anchor.union_box_normalized is not None
+        }
+    )
 
 
 def _is_stable_party_block_anchor(field: GroundedField) -> bool:

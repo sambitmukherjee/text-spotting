@@ -6,8 +6,19 @@ import os
 import pytest
 from PIL import Image, ImageDraw
 
-from invoice_grounding.grounding import ground_invoice_values, ground_invoice_values_from_ocr
-from invoice_grounding.models import GroundingConfig, GroundingStatus
+from invoice_grounding.grounding import (
+    _exclude_cross_role_owned_candidates,
+    _party_role_blocks,
+    ground_invoice_values,
+    ground_invoice_values_from_ocr,
+)
+from invoice_grounding.models import (
+    CandidateSummary,
+    GroundedField,
+    GroundingConfig,
+    GroundingStatus,
+    NormalizedBoundingBox,
+)
 
 
 def test_grounding_inherits_normalized_date(make_word) -> None:
@@ -369,6 +380,92 @@ def test_party_address_blocks_resolve_punctuation_only_state_duplicates(make_wor
     assert customer.word_ids == [words[3].id]
     assert seller.word_ids == [words[9].id]
     assert "resolved_by_context" in (customer.match_method or "")
+
+
+def test_separate_party_blocks_exclude_country_owned_by_ship_to(make_word) -> None:
+    customer_country = make_word("GB", 0, 100, 220, 140, 245, width=1000, height=800)
+    customer_business_country = make_word("GB", 1, 100, 500, 140, 525, line=1, width=1000, height=800)
+    ship_to_country = make_word("GB", 2, 600, 220, 640, 245, line=2, width=1000, height=800)
+    words_by_id = {
+        word.id: word
+        for word in (customer_country, customer_business_country, ship_to_country)
+    }
+
+    def anchor(
+        role: str,
+        field_name: str,
+        box: tuple[float, float, float, float],
+        word_ids=(),
+    ) -> GroundedField:
+        return GroundedField(
+            json_path=f"invoiceOutputData.parties.{role}.addressStructured.{field_name}",
+            field_name=field_name,
+            value="",
+            value_as_text="",
+            status=GroundingStatus.MATCHED,
+            word_ids=list(word_ids),
+            union_box_normalized=NormalizedBoundingBox(
+                x_min=box[0],
+                y_min=box[1],
+                x_max=box[2],
+                y_max=box[3],
+            ),
+        )
+
+    anchors = [
+        anchor("customer", "address", (0.10, 0.10, 0.25, 0.14)),
+        anchor("customer", "city", (0.10, 0.15, 0.18, 0.18)),
+        anchor("customer", "postal_code", (0.10, 0.19, 0.18, 0.22)),
+        anchor("shipTo", "address", (0.60, 0.10, 0.75, 0.14)),
+        anchor("shipTo", "city", (0.60, 0.15, 0.68, 0.18)),
+        anchor("shipTo", "postal_code", (0.60, 0.19, 0.68, 0.22)),
+        anchor(
+            "shipTo",
+            "country",
+            (0.60, 0.275, 0.64, 0.306),
+            word_ids=(ship_to_country.id,),
+        ),
+    ]
+    field = GroundedField(
+        json_path="invoiceOutputData.parties.customer.addressStructured.country",
+        field_name="country",
+        value="GB",
+        value_as_text="GB",
+        status=GroundingStatus.AMBIGUOUS,
+    )
+    alternatives = [
+        CandidateSummary(matched_text="GB", confidence=0.9, word_ids=[customer_country.id]),
+        CandidateSummary(matched_text="GB", confidence=0.9, word_ids=[customer_business_country.id]),
+        CandidateSummary(matched_text="GB", confidence=0.9, word_ids=[ship_to_country.id]),
+    ]
+    party_blocks = _party_role_blocks(anchors)
+
+    retained = _exclude_cross_role_owned_candidates(
+        field,
+        alternatives,
+        words_by_id,
+        anchors,
+        party_blocks,
+    )
+
+    assert [item.word_ids for item in retained] == [
+        [customer_country.id],
+        [customer_business_country.id],
+    ]
+
+    weak_ship_to_anchors = [
+        item
+        for item in anchors
+        if "shipTo" not in item.json_path or item.field_name == "country"
+    ]
+    unpruned = _exclude_cross_role_owned_candidates(
+        field,
+        alternatives,
+        words_by_id,
+        weak_ship_to_anchors,
+        _party_role_blocks(weak_ship_to_anchors),
+    )
+    assert len(unpruned) == 3
 
 
 def test_address_component_avoids_reusing_street_address_words(make_word) -> None:
